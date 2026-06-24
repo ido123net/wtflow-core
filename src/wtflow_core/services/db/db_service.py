@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from abc import abstractmethod
 
-from wtflow_core.infra.info import ExecutionInfo, RunInfo
-from wtflow_core.infra.workflow import Graph
+from wtflow_core.graph import Graph
+from wtflow_core.info import ExecutionInfo, RunInfo
 from wtflow_core.services.base_service import BaseService
 
 

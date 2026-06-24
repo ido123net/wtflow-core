@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING, Generator
 from wtflow_core.services.storage.storage_service import ArtifactWriter, StorageService
 
 if TYPE_CHECKING:
-    from wtflow_core.infra.artifact import Artifact
-    from wtflow_core.infra.nodes import Node
-    from wtflow_core.infra.workflow import Graph
+    from wtflow_core.artifact import Artifact
+    from wtflow_core.graph import Graph
+    from wtflow_core.node import Node
 
 
 class LocalArtifactWriter(ArtifactWriter):

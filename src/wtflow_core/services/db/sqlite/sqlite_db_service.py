@@ -6,21 +6,24 @@ import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import asdict
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Generator, Protocol
 from uuid import UUID
 
-from wtflow_core.infra.info import ExecutionInfo, RunInfo
+from wtflow_core.info import ExecutionInfo, RunInfo
 from wtflow_core.services.db.db_service import DBService
 
 if TYPE_CHECKING:
-    from wtflow_core.infra.workflow import Graph
+    from wtflow_core.graph import Graph
+    from wtflow_core.node import Node
 
 
 class Dataclass(Protocol):
     __dataclass_fields__: ClassVar[dict[str, Any]]
 
 
+@lru_cache
 def _digest(node: Dataclass) -> str:
     data = json.dumps(
         asdict(node),
@@ -28,6 +31,62 @@ def _digest(node: Dataclass) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def get_graph_by_digest(conn: sqlite3.Connection, graph_digest: str) -> int | None:
+    cursor = conn.execute(
+        """
+        SELECT id
+        FROM graphs
+        WHERE digest = ?
+        LIMIT 1
+        """,
+        (graph_digest,),
+    )
+    res = cursor.fetchone()
+    return res[0] if res else None
+
+
+def get_node_by_digest(conn: sqlite3.Connection, node_digest: str) -> int | None:
+    cursor = conn.execute(
+        """
+        SELECT id
+        FROM nodes
+        WHERE digest = ?
+        LIMIT 1
+        """,
+        (node_digest,),
+    )
+    res = cursor.fetchone()
+    return res[0] if res else None
+
+
+def _create_node(conn: sqlite3.Connection, node: Node) -> int:
+    node_digest = _digest(node)
+    if node_id := get_node_by_digest(conn, node_digest):
+        return node_id
+
+    cursor = conn.execute(
+        """
+        INSERT INTO nodes (
+            digest,
+            name,
+            command,
+            timeout
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            node_digest,
+            node.name,
+            node.command,
+            node.timeout,
+        ),
+    )
+
+    assert cursor.lastrowid
+    node_id = cursor.lastrowid
+    return node_id
 
 
 class Sqlite3DBService(DBService):
@@ -38,6 +97,8 @@ class Sqlite3DBService(DBService):
 
         self._execution_ids: dict[UUID, int] = {}
         self._run_ids: dict[UUID, int] = {}
+        self._graph_ids: dict[str, int] = {}
+        self._node_ids: dict[str, int] = {}
 
     @contextmanager
     def _get_connection(self) -> Generator[sqlite3.Connection]:
@@ -54,72 +115,57 @@ class Sqlite3DBService(DBService):
     async def save_graph(self, graph: Graph) -> None:
         graph_digest = _digest(graph)
 
-        node_digests = {node: _digest(node) for node in graph.nodes}
-
         with self._get_connection() as conn:
-            conn.execute(
+            if get_graph_by_digest(conn, graph_digest):
+                return
+
+            cursor = conn.execute(
                 """
                 INSERT INTO graphs (digest, name)
                 VALUES (?, ?)
-                ON CONFLICT(digest) DO NOTHING
                 """,
                 (graph_digest, graph.name),
             )
 
-            for node, node_digest in node_digests.items():
-                conn.execute(
-                    """
-                    INSERT INTO nodes (
-                        digest,
-                        name,
-                        command,
-                        timeout
-                    )
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(digest) DO NOTHING
-                    """,
-                    (
-                        node_digest,
-                        node.name,
-                        node.command,
-                        node.timeout,
-                    ),
-                )
+            assert cursor.lastrowid
+            graph_id = cursor.lastrowid
+            node_ids: dict[str, int] = {}
+
+            for node in graph.nodes:
+                node_id = _create_node(conn, node)
+                node_ids[_digest(node)] = node_id
 
                 conn.execute(
                     """
                     INSERT INTO graph_nodes (
-                        graph_digest,
-                        node_digest
+                        graph_id,
+                        node_id
                     )
                     VALUES (?, ?)
-                    ON CONFLICT(graph_digest, node_digest) DO NOTHING
                     """,
                     (
-                        graph_digest,
-                        node_digest,
+                        graph_id,
+                        node_id,
                     ),
                 )
 
             for from_node, to_node in graph.edges:
+                from_node_id = node_ids[_digest(from_node)]
+                to_node_id = node_ids[_digest(to_node)]
+
                 conn.execute(
                     """
                     INSERT INTO graph_edges (
-                        graph_digest,
-                        from_node_digest,
-                        to_node_digest
+                        graph_id,
+                        from_node_id,
+                        to_node_id
                     )
                     VALUES (?, ?, ?)
-                    ON CONFLICT(
-                        graph_digest,
-                        from_node_digest,
-                        to_node_digest
-                    ) DO NOTHING
                     """,
                     (
-                        graph_digest,
-                        node_digests[from_node],
-                        node_digests[to_node],
+                        graph_id,
+                        from_node_id,
+                        to_node_id,
                     ),
                 )
 
@@ -127,36 +173,25 @@ class Sqlite3DBService(DBService):
 
     async def start_run(self, run_info: RunInfo) -> None:
         graph_digest = _digest(run_info.graph)
-        system_info = run_info.system_info
 
         with self._get_connection() as conn:
+            graph_id = get_graph_by_digest(conn, graph_digest)
+            print(graph_id)
             cursor = conn.execute(
                 """
                 INSERT INTO runs (
-                    graph_digest,
+                    graph_id,
                     created_at,
                     start_time,
-                    end_time,
-                    hostname,
-                    os_name,
-                    os_release,
-                    os_version,
-                    machine,
-                    cpu_count
+                    end_time
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 """,
                 (
-                    graph_digest,
+                    graph_id,
                     run_info.created_at,
                     run_info.start_time,
                     run_info.end_time,
-                    system_info.hostname,
-                    system_info.os_name,
-                    system_info.os_release,
-                    system_info.os_version,
-                    system_info.machine,
-                    system_info.cpu_count,
                 ),
             )
             conn.commit()
@@ -185,22 +220,23 @@ class Sqlite3DBService(DBService):
 
     async def start_execution(self, run_info: RunInfo, execution_info: ExecutionInfo) -> None:
         node_digest = _digest(execution_info.node)
-        _run_id = self._run_ids[run_info.run_id]
+        run_id = self._run_ids[run_info.run_id]
 
         with self._get_connection() as conn:
+            node_id = get_node_by_digest(conn, node_digest)
             curser = conn.execute(
                 """
                 INSERT INTO executions (
                     run_id,
-                    node_digest,
+                    node_id,
                     start_time,
                     end_time
                 )
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    _run_id,
-                    node_digest,
+                    run_id,
+                    node_id,
                     execution_info.start_time,
                     execution_info.end_time,
                 ),
@@ -237,79 +273,74 @@ class Sqlite3DBService(DBService):
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS nodes (
-                    digest TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    digest TEXT NOT NULL UNIQUE,
                     name TEXT NOT NULL,
                     command TEXT,
                     timeout REAL
                 );
 
                 CREATE TABLE IF NOT EXISTS graphs (
-                    digest TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    digest TEXT NOT NULL UNIQUE,
                     name TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS graph_nodes (
-                    graph_digest TEXT NOT NULL,
-                    node_digest TEXT NOT NULL,
+                    graph_id INTEGER NOT NULL,
+                    node_id INTEGER NOT NULL,
 
-                    PRIMARY KEY (graph_digest, node_digest),
+                    PRIMARY KEY (graph_id, node_id),
 
-                    FOREIGN KEY (graph_digest)
-                        REFERENCES graphs(digest)
+                    FOREIGN KEY (graph_id)
+                        REFERENCES graphs(id)
                         ON DELETE CASCADE,
 
-                    FOREIGN KEY (node_digest)
-                        REFERENCES nodes(digest)
+                    FOREIGN KEY (node_id)
+                        REFERENCES nodes(id)
                         ON DELETE RESTRICT
                 );
 
                 CREATE TABLE IF NOT EXISTS graph_edges (
-                    graph_digest TEXT NOT NULL,
-                    from_node_digest TEXT NOT NULL,
-                    to_node_digest TEXT NOT NULL,
+                    graph_id INTEGER NOT NULL,
+                    from_node_id INTEGER NOT NULL,
+                    to_node_id INTEGER NOT NULL,
 
                     PRIMARY KEY (
-                        graph_digest,
-                        from_node_digest,
-                        to_node_digest
+                        graph_id,
+                        from_node_id,
+                        to_node_id
                     ),
 
-                    FOREIGN KEY (graph_digest)
-                        REFERENCES graphs(digest)
+                    FOREIGN KEY (graph_id)
+                        REFERENCES graphs(id)
                         ON DELETE CASCADE,
 
-                    FOREIGN KEY (from_node_digest)
-                        REFERENCES nodes(digest)
+                    FOREIGN KEY (from_node_id)
+                        REFERENCES nodes(id)
                         ON DELETE RESTRICT,
 
-                    FOREIGN KEY (to_node_digest)
-                        REFERENCES nodes(digest)
+                    FOREIGN KEY (to_node_id)
+                        REFERENCES nodes(id)
                         ON DELETE RESTRICT
                 );
 
                 CREATE TABLE IF NOT EXISTS runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    graph_digest TEXT NOT NULL,
+                    graph_id INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     start_time TEXT,
                     end_time TEXT,
 
-                    hostname TEXT NOT NULL,
-                    os_name TEXT NOT NULL,
-                    os_release TEXT NOT NULL,
-                    os_version TEXT NOT NULL,
-                    machine TEXT NOT NULL,
-                    cpu_count INTEGER,
-
-                    FOREIGN KEY (graph_digest)
-                        REFERENCES graphs(digest)
+                    FOREIGN KEY (graph_id)
+                        REFERENCES graphs(id)
                         ON DELETE RESTRICT
                 );
 
                 CREATE TABLE IF NOT EXISTS executions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id INTEGER NOT NULL,
-                    node_digest TEXT NOT NULL,
+                    node_id INTEGER NOT NULL,
                     start_time TEXT,
                     end_time TEXT,
 
@@ -317,13 +348,28 @@ class Sqlite3DBService(DBService):
                         REFERENCES runs(id)
                         ON DELETE CASCADE,
 
-                    FOREIGN KEY (node_digest)
-                        REFERENCES nodes(digest)
+                    FOREIGN KEY (node_id)
+                        REFERENCES nodes(id)
                         ON DELETE RESTRICT
                 );
 
-                CREATE INDEX IF NOT EXISTS executions_run_id_idx
-                    ON executions(run_id);
+                CREATE INDEX IF NOT EXISTS idx_graph_nodes_node_id
+                ON graph_nodes(node_id);
+
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_from_node_id
+                ON graph_edges(from_node_id);
+
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_to_node_id
+                ON graph_edges(to_node_id);
+
+                CREATE INDEX IF NOT EXISTS idx_runs_graph_id
+                ON runs(graph_id);
+
+                CREATE INDEX IF NOT EXISTS idx_executions_run_id
+                ON executions(run_id);
+
+                CREATE INDEX IF NOT EXISTS idx_executions_node_id
+                ON executions(node_id);
                 """
             )
             conn.commit()

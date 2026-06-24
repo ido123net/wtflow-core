@@ -3,9 +3,8 @@ import time
 import pytest
 
 from wtflow_core.config import Config
-from wtflow_core.infra.engine import Engine, ExitCode
-from wtflow_core.infra.nodes import TreeNode
-from wtflow_core.infra.workflow import Tree
+from wtflow_core.engine import Engine, ExitCode
+from wtflow_core.tree import Tree, TreeNode
 
 
 @pytest.mark.asyncio
