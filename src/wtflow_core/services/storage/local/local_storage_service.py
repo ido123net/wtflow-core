@@ -3,14 +3,12 @@ from __future__ import annotations
 import pathlib
 from contextlib import closing, contextmanager
 from io import BufferedWriter
-from typing import TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Any, Generator
 
 from wtflow_core.services.storage.storage_service import ArtifactWriter, StorageService
 
 if TYPE_CHECKING:
     from wtflow_core.artifact import Artifact
-    from wtflow_core.graph import Graph
-    from wtflow_core.node import Node
 
 
 class LocalArtifactWriter(ArtifactWriter):
@@ -37,22 +35,20 @@ class LocalStorageService(StorageService):
 
     def _get_path(
         self,
-        workflow: Graph,
-        node: Node,
+        run_id: Any,
+        execution_id: Any,
         name: str,
         file_type: str,
     ) -> pathlib.Path:
-        workflow_id = workflow.name
-        node_id = node.name
-        return self.base_path / str(workflow_id) / str(node_id) / f"{name}.{file_type}"
+        return self.base_path / str(run_id) / str(execution_id) / f"{name}.{file_type}"
 
     @contextmanager
     def open_artifact(
         self,
-        workflow: Graph,
-        node: Node,
+        run_id: Any,
+        execution_id: Any,
         artifact: Artifact,
     ) -> Generator[LocalArtifactWriter, None, None]:
-        path = self._get_path(workflow, node, artifact.name, artifact.file_type)
+        path = self._get_path(run_id, execution_id, artifact.name, artifact.file_type)
         with closing(LocalArtifactWriter(path)) as writer:
             yield writer

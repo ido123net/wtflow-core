@@ -3,14 +3,12 @@ from __future__ import annotations
 import sys
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, contextmanager
-from typing import TYPE_CHECKING, BinaryIO, Generator
+from typing import TYPE_CHECKING, Any, BinaryIO, Generator
 
 from wtflow_core.services.base_service import BaseService
 
 if TYPE_CHECKING:
     from wtflow_core.artifact import Artifact
-    from wtflow_core.graph import Graph
-    from wtflow_core.node import Node
 
 
 class ArtifactWriter(ABC):
@@ -25,8 +23,8 @@ class StorageService(BaseService):
     @abstractmethod
     def open_artifact(
         self,
-        workflow: Graph,
-        node: Node,
+        run_id: Any,
+        execution_id: Any,
         artifact: Artifact,
     ) -> AbstractContextManager[ArtifactWriter]: ...
 
@@ -46,8 +44,8 @@ class NoStorageService(StorageService):
     @contextmanager
     def open_artifact(
         self,
-        workflow: Graph,
-        node: Node,
+        run_id: Any,
+        execution_id: Any,
         artifact: Artifact,
     ) -> Generator[StreamArtifactWriter, None, None]:
         if artifact.name == "stdout":

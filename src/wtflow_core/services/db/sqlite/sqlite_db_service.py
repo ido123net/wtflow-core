@@ -5,13 +5,12 @@ import json
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Generator, Protocol
 from uuid import UUID
 
-from wtflow_core.info import ExecutionInfo, RunInfo
 from wtflow_core.services.db.db_service import DBService
 
 if TYPE_CHECKING:
@@ -107,28 +106,29 @@ class Sqlite3DBService(DBService):
         with closing(sqlite3.connect(self.database_path)) as cx:
             cx.execute("PRAGMA foreign_keys = ON")
             yield cx
+            cx.commit()
 
     @staticmethod
     def _adapt_datetime(dt: datetime) -> str:
         return dt.isoformat()
 
-    async def save_graph(self, graph: Graph) -> None:
+    async def save_run(self, graph: Graph) -> int:
         graph_digest = _digest(graph)
 
         with self._get_connection() as conn:
-            if get_graph_by_digest(conn, graph_digest):
-                return
+            graph_id = get_graph_by_digest(conn, graph_digest)
+            if not graph_id:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO graphs (digest, name)
+                    VALUES (?, ?)
+                    ON CONFLICT(digest) DO NOTHING
+                    """,
+                    (graph_digest, graph.name),
+                )
 
-            cursor = conn.execute(
-                """
-                INSERT INTO graphs (digest, name)
-                VALUES (?, ?)
-                """,
-                (graph_digest, graph.name),
-            )
-
-            assert cursor.lastrowid
-            graph_id = cursor.lastrowid
+                assert cursor.lastrowid
+                graph_id = cursor.lastrowid
             node_ids: dict[str, int] = {}
 
             for node in graph.nodes:
@@ -142,6 +142,7 @@ class Sqlite3DBService(DBService):
                         node_id
                     )
                     VALUES (?, ?)
+                    ON CONFLICT(graph_id, node_id) DO NOTHING
                     """,
                     (
                         graph_id,
@@ -161,6 +162,11 @@ class Sqlite3DBService(DBService):
                         to_node_id
                     )
                     VALUES (?, ?, ?)
+                    ON CONFLICT(
+                        graph_id,
+                        from_node_id,
+                        to_node_id
+                    ) DO NOTHING
                     """,
                     (
                         graph_id,
@@ -169,58 +175,43 @@ class Sqlite3DBService(DBService):
                     ),
                 )
 
-            conn.commit()
-
-    async def start_run(self, run_info: RunInfo) -> None:
-        graph_digest = _digest(run_info.graph)
-
-        with self._get_connection() as conn:
-            graph_id = get_graph_by_digest(conn, graph_digest)
-            print(graph_id)
             cursor = conn.execute(
                 """
-                INSERT INTO runs (
-                    graph_id,
-                    created_at,
-                    start_time,
-                    end_time
-                )
-                VALUES (?, ?, ?, ?)
+                INSERT INTO runs (graph_id, created_at)
+                VALUES (?, ?)
                 """,
-                (
-                    graph_id,
-                    run_info.created_at,
-                    run_info.start_time,
-                    run_info.end_time,
-                ),
+                (graph_id, datetime.now(tz=timezone.utc)),
             )
-            conn.commit()
             assert cursor.lastrowid
-            self._run_ids[run_info.run_id] = cursor.lastrowid
+            return cursor.lastrowid
 
-    async def finish_run(self, run_info: RunInfo) -> None:
-        _id = self._run_ids.pop(run_info.run_id)
+    async def start_run(self, run_id: int) -> None:
         with self._get_connection() as conn:
             conn.execute(
                 """
                 UPDATE runs
-                SET
-                    start_time = ?,
-                    end_time = ?
+                SET start_time = ?
+                WHERE id = ?
+                """,
+                (datetime.now(tz=timezone.utc), run_id),
+            )
+
+    async def finish_run(self, run_id: int) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET end_time = ?
                 WHERE id = ?
                 """,
                 (
-                    run_info.start_time,
-                    run_info.end_time,
-                    _id,
+                    datetime.now(tz=timezone.utc),
+                    run_id,
                 ),
             )
 
-            conn.commit()
-
-    async def start_execution(self, run_info: RunInfo, execution_info: ExecutionInfo) -> None:
-        node_digest = _digest(execution_info.node)
-        run_id = self._run_ids[run_info.run_id]
+    async def start_execution(self, run_id: int, node: Node) -> int:
+        node_digest = _digest(node)
 
         with self._get_connection() as conn:
             node_id = get_node_by_digest(conn, node_digest)
@@ -229,44 +220,33 @@ class Sqlite3DBService(DBService):
                 INSERT INTO executions (
                     run_id,
                     node_id,
-                    start_time,
-                    end_time
+                    start_time
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?)
                 """,
                 (
                     run_id,
                     node_id,
-                    execution_info.start_time,
-                    execution_info.end_time,
+                    datetime.now(tz=timezone.utc),
                 ),
             )
-            conn.commit()
             assert curser.lastrowid
-            self._execution_ids[execution_info.execution_id] = curser.lastrowid
+            return curser.lastrowid
 
-    async def finish_execution(self, run_info: RunInfo, execution_info: ExecutionInfo) -> None:
-        _id = self._execution_ids.pop(execution_info.execution_id)
-        _run_id = self._run_ids[run_info.run_id]
-
+    async def finish_execution(self, run_id: int, execution_id: int) -> None:
         with self._get_connection() as conn:
             conn.execute(
                 """
                 UPDATE executions
-                SET
-                    start_time = ?,
-                    end_time = ?
+                SET end_time = ?
                 WHERE id = ? AND run_id = ?
                 """,
                 (
-                    execution_info.start_time,
-                    execution_info.end_time,
-                    _id,
-                    _run_id,
+                    datetime.now(tz=timezone.utc),
+                    execution_id,
+                    run_id,
                 ),
             )
-
-            conn.commit()
 
     def _create_tables(self) -> None:
         with self._get_connection() as conn:
