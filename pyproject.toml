@@ -1,6 +1,6 @@
 [project]
 name = "wtflow-core"
-version = "0.0.0"
+version = "0.0.1"
 description = "Core package for async workflow orchestration"
 readme = "README.md"
 authors = [
