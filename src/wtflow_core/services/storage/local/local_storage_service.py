@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import pathlib
-from contextlib import closing, contextmanager
 from io import BufferedWriter
-from typing import TYPE_CHECKING, Any, Generator
+from typing import TYPE_CHECKING, Any
 
 from wtflow_core.services.storage.storage_service import ArtifactWriter, StorageService
 
@@ -42,13 +41,11 @@ class LocalStorageService(StorageService):
     ) -> pathlib.Path:
         return self.base_path / str(run_id) / str(execution_id) / f"{name}.{file_type}"
 
-    @contextmanager
     def open_artifact(
         self,
         run_id: Any,
         execution_id: Any,
         artifact: Artifact,
-    ) -> Generator[LocalArtifactWriter, None, None]:
+    ) -> LocalArtifactWriter:
         path = self._get_path(run_id, execution_id, artifact.name, artifact.file_type)
-        with closing(LocalArtifactWriter(path)) as writer:
-            yield writer
+        return LocalArtifactWriter(path)

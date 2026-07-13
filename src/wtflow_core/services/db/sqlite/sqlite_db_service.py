@@ -8,14 +8,12 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Generator, Protocol
+from typing import Any, ClassVar, Generator, Protocol
 from uuid import UUID
 
+from wtflow_core.graph import Graph
+from wtflow_core.node import Node, NodeOutcome
 from wtflow_core.services.db.db_service import DBService
-
-if TYPE_CHECKING:
-    from wtflow_core.graph import Graph
-    from wtflow_core.node import Node
 
 
 class Dataclass(Protocol):
@@ -233,16 +231,18 @@ class Sqlite3DBService(DBService):
             assert curser.lastrowid
             return curser.lastrowid
 
-    async def finish_execution(self, run_id: int, execution_id: int) -> None:
+    async def finish_execution(self, run_id: int, execution_id: int, node_outcome: NodeOutcome) -> None:
         with self._get_connection() as conn:
             conn.execute(
                 """
                 UPDATE executions
-                SET end_time = ?
+                SET end_time = ?, result = ?, retcode = ?
                 WHERE id = ? AND run_id = ?
                 """,
                 (
                     datetime.now(tz=timezone.utc),
+                    node_outcome.result,
+                    node_outcome.retcode,
                     execution_id,
                     run_id,
                 ),
@@ -321,6 +321,8 @@ class Sqlite3DBService(DBService):
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id INTEGER NOT NULL,
                     node_id INTEGER NOT NULL,
+                    result INTEGER,
+                    retcode INTEGER,
                     start_time TEXT,
                     end_time TEXT,
 

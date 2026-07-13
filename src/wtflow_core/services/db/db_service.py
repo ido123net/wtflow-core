@@ -4,7 +4,7 @@ from abc import abstractmethod
 from typing import Any
 
 from wtflow_core.graph import Graph
-from wtflow_core.node import Node
+from wtflow_core.node import Node, NodeOutcome
 from wtflow_core.services.base_service import BaseService
 
 
@@ -22,7 +22,7 @@ class DBService(BaseService):
     async def start_execution(self, run_id: Any, node: Node) -> Any: ...
 
     @abstractmethod
-    async def finish_execution(self, run_id: Any, execution_id: Any) -> None: ...
+    async def finish_execution(self, run_id: Any, execution_id: Any, node_outcome: NodeOutcome) -> None: ...
 
 
 class NoDBService(DBService):
@@ -38,5 +38,5 @@ class NoDBService(DBService):
     async def start_execution(self, run_id: Any, node: Node) -> Any:
         return node.name
 
-    async def finish_execution(self, run_id: Any, execution_id: Any) -> None:
+    async def finish_execution(self, run_id: Any, execution_id: Any, node_outcome: NodeOutcome) -> None:
         pass

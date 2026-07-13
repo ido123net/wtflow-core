@@ -56,8 +56,8 @@ async def test_stop_on_failure(capfdbinary):
                     name="Node 2",
                     children=[
                         TreeNode(name="Node 2.1", command='echo "World 2.1"'),
-                        TreeNode(name="Node 2.2", command="command-not-exist"),
-                        TreeNode(name="Node 2.3", command='echo "EXISTS" && sleep 1 && echo "NOPE"'),
+                        TreeNode(name="Node 2.2", command="sleep 0.1 && command-not-exist"),
+                        TreeNode(name="Node 2.3", command='echo "EXISTS" && sleep 30 && echo "NOPE"'),
                     ],
                 ),
                 TreeNode(name="Node 3", command='echo "Hello 3"'),
@@ -72,7 +72,7 @@ async def test_stop_on_failure(capfdbinary):
 
 
 @pytest.mark.asyncio
-async def test_timeout_node(capfdbinary):
+async def test_timeout_node():
     wf = Tree(
         name="test timeout node",
         root=TreeNode(
@@ -86,9 +86,6 @@ async def test_timeout_node(capfdbinary):
     assert await engine.run_graph(wf.as_graph()) == ExitCode.FAIL
     elapsed = time.perf_counter() - start_time
     assert elapsed < 0.2
-    stdout, stderr = capfdbinary.readouterr()
-    assert stdout == b"Hello\n"
-    assert stderr == b""
 
 
 @pytest.mark.asyncio

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import sys
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager, contextmanager
-from typing import TYPE_CHECKING, Any, BinaryIO, Generator
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 from wtflow_core.services.base_service import BaseService
 
@@ -26,7 +25,7 @@ class StorageService(BaseService):
         run_id: Any,
         execution_id: Any,
         artifact: Artifact,
-    ) -> AbstractContextManager[ArtifactWriter]: ...
+    ) -> ArtifactWriter: ...
 
 
 class StreamArtifactWriter(ArtifactWriter):
@@ -41,20 +40,16 @@ class StreamArtifactWriter(ArtifactWriter):
 
 
 class NoStorageService(StorageService):
-    @contextmanager
     def open_artifact(
         self,
         run_id: Any,
         execution_id: Any,
         artifact: Artifact,
-    ) -> Generator[StreamArtifactWriter, None, None]:
+    ) -> StreamArtifactWriter:
         if artifact.name == "stdout":
             writer = StreamArtifactWriter(sys.stdout.buffer)
         elif artifact.name == "stderr":
             writer = StreamArtifactWriter(sys.stderr.buffer)
         else:  # pragma: no cover
             raise NotImplementedError(f"Artifact {artifact.name} is not supported in {self.__class__.__name__}")
-        try:
-            yield writer
-        finally:
-            writer.close()
+        return writer

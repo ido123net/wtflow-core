@@ -13,7 +13,7 @@ class Graph:
     edges: tuple[tuple[Node, Node], ...] = field(default_factory=tuple)
 
     def items(self) -> set[tuple[Node, tuple[Node, ...]]]:
-        predecessors = defaultdict[Node, set[Node]](set)
-        for parent, child in self.edges:
-            predecessors[child].add(parent)
+        predecessors = defaultdict[Node, list[Node]](list)
+        for child, parent in self.edges:
+            predecessors[child].append(parent)
         return {(node, tuple(predecessors[node])) for node in self.nodes}
