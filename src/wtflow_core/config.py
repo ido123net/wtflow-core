@@ -10,7 +10,8 @@ from wtflow_core.services.storage.storage_service import NoStorageService, Stora
 
 class DatabaseConfig(ABC):
     @abstractmethod
-    def create_db_service(self) -> DBService: ...
+    def create_db_service(self) -> DBService:
+        return NotImplemented
 
 
 class NoDatabaseConfig(DatabaseConfig):
@@ -30,7 +31,8 @@ class Sqlite3Config(DatabaseConfig):
 
 class StorageConfig(ABC):
     @abstractmethod
-    def create_storage_service(self) -> StorageService: ...
+    def create_storage_service(self) -> StorageService:
+        return NotImplemented
 
 
 class NoStorageConfig(StorageConfig):

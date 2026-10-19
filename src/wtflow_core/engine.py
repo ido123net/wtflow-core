@@ -6,16 +6,16 @@ import os
 import signal
 from enum import IntEnum
 from graphlib import TopologicalSorter
-from typing import TYPE_CHECKING, Any
+from types import TracebackType
+from typing import Self
 
 from wtflow_core.artifact import Artifact
 from wtflow_core.config import Config
-from wtflow_core.services.servicer import Servicer
-
-if TYPE_CHECKING:
-    from wtflow_core.graph import Graph
-    from wtflow_core.node import Node
-    from wtflow_core.services.storage.storage_service import StorageService
+from wtflow_core.graph import Graph
+from wtflow_core.info import ExecutionInfo, RunInfo
+from wtflow_core.node import Node
+from wtflow_core.services.db.db_service import DBService
+from wtflow_core.services.storage.storage_service import StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +32,9 @@ class NodeResult(IntEnum):
     CANCEL = 3
 
 
-async def _wait_process(process: asyncio.subprocess.Process, timeout: float | None) -> NodeResult:
+async def _wait_process(process: asyncio.subprocess.Process) -> int:
     try:
-        result = await asyncio.wait_for(process.wait(), timeout)
-        return NodeResult.FAIL if result else NodeResult.SUCCESS
-    except asyncio.TimeoutError:
-        return NodeResult.TIMEOUT
-    except asyncio.CancelledError:
-        return NodeResult.CANCEL
+        return await process.wait()
     finally:
         if process.returncode is None:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
@@ -57,86 +52,119 @@ async def _start_process(command: str) -> asyncio.subprocess.Process:
 
 async def _read_stream(
     storage_service: StorageService,
-    run_id: Any,
-    execution_id: Any,
+    workflow: Graph,
+    node: Node,
     stream: asyncio.StreamReader,
     artifact: Artifact,
 ) -> None:
-    with storage_service.open_artifact(run_id, execution_id, artifact) as f:
+    with storage_service.open_artifact(workflow, node, artifact) as f:
         while data := await stream.readline():
             f.write(data)
 
 
 class Executor:
-    def __init__(self, graph: Graph, servicer: Servicer) -> None:
+    def __init__(self, graph: Graph, db_service: DBService, storage_service: StorageService) -> None:
         self.graph = graph
-        self.servicer = servicer
-        self.db_service = servicer.db_service
+        self.db_service = db_service
+        self.storage_service = storage_service
+        self.ts = TopologicalSorter(self.graph)
+        self._failing_tasks = 0
+        self._running_tasks: set[asyncio.Task[tuple[Node, NodeResult]]] = set()
 
-    async def execute(self, run_id: Any) -> ExitCode:
-        ts = TopologicalSorter(self.graph)
-        ts.prepare()
-        while ts.is_active():
-            ready_nodes = ts.get_ready()
-            tasks = [asyncio.create_task(self.execute_node(run_id, node, ts)) for node in ready_nodes]
+    def _start_ready_nodes(self, run_info: RunInfo) -> None:
+        for ready_node in self.ts.get_ready():
+            self._running_tasks.add(asyncio.create_task(self.execute_node(ready_node, run_info)))
+
+    async def _is_done(self) -> bool:
+        done_tasks = {task for task in self._running_tasks if task.done()}
+        for done_task in done_tasks:
+            node, result = await done_task
+            self.ts.done(node)
+            if result is not NodeResult.SUCCESS:
+                self._failing_tasks += 1
+
+        self._running_tasks = self._running_tasks - done_tasks
+
+        return self._failing_tasks > 0 or not (self.ts.is_active() or self._running_tasks)
+
+    async def _cancel_running(self) -> None:
+        for task in self._running_tasks:
+            task.cancel()
+        await asyncio.gather(*self._running_tasks, return_exceptions=True)
+        self._running_tasks.clear()
+
+    async def execute(self) -> ExitCode:
+        self.ts.prepare()
+
+        with RunInfo(graph=self.graph) as run_info:
+            await self.db_service.start_run(run_info)
+            while True:
+                if await self._is_done():
+                    await self._cancel_running()
+                    break
+                self._start_ready_nodes(run_info)
+                await asyncio.sleep(0.001)
+        await self.db_service.finish_run(run_info)
+
+        return ExitCode.FAIL if self._failing_tasks > 0 else ExitCode.SUCCESS
+
+    async def execute_node(self, node: Node, run_info: RunInfo) -> tuple[Node, NodeResult]:
+        with ExecutionInfo(run_info=run_info, node=node) as execution_info:
+            await self.db_service.start_execution(execution_info)
+            retcode = None
             try:
-                await asyncio.gather(*tasks)
-            except Exception:
-                return ExitCode.FAIL
-        return ExitCode.SUCCESS
+                retcode = await asyncio.wait_for(self._execute_node(node), node.timeout)
+                result = NodeResult.SUCCESS if retcode == 0 else NodeResult.FAIL
+            except asyncio.CancelledError:
+                result = NodeResult.CANCEL
+            except TimeoutError:
+                result = NodeResult.TIMEOUT
+            execution_info.retcode = retcode
+            execution_info.result = result
 
-    async def execute_node(self, run_id: Any, node: Node, ts: TopologicalSorter[Node]) -> NodeResult:
-        execution_id = await self.db_service.start_execution(run_id, node)
-        try:
-            result = await self._execute_node(node, run_id, execution_id)
-            await self.db_service.finish_execution(run_id, execution_id)
-            if result:
-                raise Exception
-            return result
-        finally:
-            ts.done(node)
+        await self.db_service.finish_execution(execution_info)
+        return node, result
 
-    async def _execute_node(self, node: Node, run_id: Any, execution_id: Any) -> NodeResult:
+    async def _execute_node(self, node: Node) -> int:
         if not node.command:
             return NodeResult.SUCCESS
 
         process = await _start_process(node.command)
-        stream_tasks = [
-            self._stream_task(process, artifact_name, run_id, execution_id) for artifact_name in ("stdout", "stderr")
-        ]
-        result = await _wait_process(process, node.timeout)
-        await asyncio.gather(*stream_tasks)
-        return result
-
-    def _stream_task(
-        self,
-        process: asyncio.subprocess.Process,
-        artifact_name: str,
-        run_id: Any,
-        execution_id: Any,
-    ) -> asyncio.Task[None]:
-        artifact = Artifact(artifact_name)
-        stream: asyncio.StreamReader = getattr(process, artifact_name)
-        return asyncio.create_task(_read_stream(self.servicer.storage_service, run_id, execution_id, stream, artifact))
+        async with asyncio.TaskGroup() as tg:
+            for artifact_name in ("stdout", "stderr"):
+                artifact = Artifact(artifact_name)
+                stream: asyncio.StreamReader = getattr(process, artifact_name)
+                tg.create_task(_read_stream(self.storage_service, self.graph, node, stream, artifact))
+            result = tg.create_task(_wait_process(process))
+        return await result
 
 
 class Engine:
     def __init__(self, config: Config | None = None) -> None:
         self.config = config or Config()
-        self.servicer = Servicer.from_config(self.config)
-        self.db_service = self.servicer.db_service
-
-    async def save_run(self, graph: Graph) -> Any:
-        return await self.db_service.save_run(graph)
-
-    async def execute(self, graph: Graph, run_id: Any) -> int:
-        executor = Executor(graph, self.servicer)
-        await self.db_service.start_run(run_id)
-        result = await executor.execute(run_id)
-        await self.db_service.finish_run(run_id)
-        return result
 
     async def run_graph(self, graph: Graph) -> int:
-        run_id = await self.save_run(graph)
-        result = await self.execute(graph, run_id)
+        await self.db_service.save_graph(graph)
+        executor = Executor(graph, self.db_service, self.storage_service)
+        result = await executor.execute()
         return result
+
+    def start(self) -> None:
+        self.db_service = self.config.database.create_db_service()
+        self.storage_service = self.config.storage.create_storage_service()
+
+    def close(self) -> None:
+        self.db_service.close()
+        self.storage_service.close()
+
+    def __enter__(self) -> Self:
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()

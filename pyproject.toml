@@ -29,7 +29,10 @@ line-length = 120
 extend-select = ["I"]
 
 [tool.coverage.run]
+plugins = ["covdefaults"]
 source = ["src", "tests"]
+concurrency = ["multiprocessing", "thread"]
+patch = ["subprocess"]
 
 [tool.coverage.report]
 show_missing = true
