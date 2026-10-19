@@ -2,31 +2,35 @@ from __future__ import annotations
 
 import sys
 from abc import ABC, abstractmethod
+from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager
-from typing import TYPE_CHECKING, Any, BinaryIO, Generator
+from typing import BinaryIO
 
+from wtflow_core.artifact import Artifact
+from wtflow_core.graph import Graph
+from wtflow_core.node import Node
 from wtflow_core.services.base_service import BaseService
-
-if TYPE_CHECKING:
-    from wtflow_core.artifact import Artifact
 
 
 class ArtifactWriter(ABC):
     @abstractmethod
-    def write(self, data: bytes) -> int: ...
+    def write(self, data: bytes) -> int:
+        raise NotImplementedError
 
     @abstractmethod
-    def close(self) -> None: ...
+    def close(self) -> None:
+        raise NotImplementedError
 
 
 class StorageService(BaseService):
     @abstractmethod
     def open_artifact(
         self,
-        run_id: Any,
-        execution_id: Any,
+        workflow: Graph,
+        node: Node,
         artifact: Artifact,
-    ) -> AbstractContextManager[ArtifactWriter]: ...
+    ) -> AbstractContextManager[ArtifactWriter]:
+        raise NotImplementedError
 
 
 class StreamArtifactWriter(ArtifactWriter):
@@ -44,15 +48,15 @@ class NoStorageService(StorageService):
     @contextmanager
     def open_artifact(
         self,
-        run_id: Any,
-        execution_id: Any,
+        workflow: Graph,
+        node: Node,
         artifact: Artifact,
     ) -> Generator[StreamArtifactWriter, None, None]:
         if artifact.name == "stdout":
             writer = StreamArtifactWriter(sys.stdout.buffer)
         elif artifact.name == "stderr":
             writer = StreamArtifactWriter(sys.stderr.buffer)
-        else:  # pragma: no cover
+        else:
             raise NotImplementedError(f"Artifact {artifact.name} is not supported in {self.__class__.__name__}")
         try:
             yield writer

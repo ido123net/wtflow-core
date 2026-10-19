@@ -3,89 +3,30 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Generator
 from contextlib import closing, contextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
-from functools import lru_cache
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Generator, Protocol
+from typing import Any, ClassVar, Protocol
 from uuid import UUID
 
+from wtflow_core.graph import Graph
+from wtflow_core.info import ExecutionInfo, RunInfo
 from wtflow_core.services.db.db_service import DBService
-
-if TYPE_CHECKING:
-    from wtflow_core.graph import Graph
-    from wtflow_core.node import Node
 
 
 class Dataclass(Protocol):
     __dataclass_fields__: ClassVar[dict[str, Any]]
 
 
-@lru_cache
-def _digest(node: Dataclass) -> str:
+def digest(obj: Dataclass) -> str:
     data = json.dumps(
-        asdict(node),
+        asdict(obj),
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-
-def get_graph_by_digest(conn: sqlite3.Connection, graph_digest: str) -> int | None:
-    cursor = conn.execute(
-        """
-        SELECT id
-        FROM graphs
-        WHERE digest = ?
-        LIMIT 1
-        """,
-        (graph_digest,),
-    )
-    res = cursor.fetchone()
-    return res[0] if res else None
-
-
-def get_node_by_digest(conn: sqlite3.Connection, node_digest: str) -> int | None:
-    cursor = conn.execute(
-        """
-        SELECT id
-        FROM nodes
-        WHERE digest = ?
-        LIMIT 1
-        """,
-        (node_digest,),
-    )
-    res = cursor.fetchone()
-    return res[0] if res else None
-
-
-def _create_node(conn: sqlite3.Connection, node: Node) -> int:
-    node_digest = _digest(node)
-    if node_id := get_node_by_digest(conn, node_digest):
-        return node_id
-
-    cursor = conn.execute(
-        """
-        INSERT INTO nodes (
-            digest,
-            name,
-            command,
-            timeout
-        )
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            node_digest,
-            node.name,
-            node.command,
-            node.timeout,
-        ),
-    )
-
-    assert cursor.lastrowid
-    node_id = cursor.lastrowid
-    return node_id
 
 
 class Sqlite3DBService(DBService):
@@ -96,8 +37,6 @@ class Sqlite3DBService(DBService):
 
         self._execution_ids: dict[UUID, int] = {}
         self._run_ids: dict[UUID, int] = {}
-        self._graph_ids: dict[str, int] = {}
-        self._node_ids: dict[str, int] = {}
 
     @contextmanager
     def _get_connection(self) -> Generator[sqlite3.Connection]:
@@ -106,221 +45,276 @@ class Sqlite3DBService(DBService):
         with closing(sqlite3.connect(self.database_path)) as cx:
             cx.execute("PRAGMA foreign_keys = ON")
             yield cx
-            cx.commit()
 
     @staticmethod
     def _adapt_datetime(dt: datetime) -> str:
         return dt.isoformat()
 
-    async def save_run(self, graph: Graph) -> int:
-        graph_digest = _digest(graph)
+    async def save_graph(self, graph: Graph) -> None:
+        graph_digest = digest(graph)
+
+        node_digests = {node: digest(node) for node in graph.nodes}
 
         with self._get_connection() as conn:
-            graph_id = get_graph_by_digest(conn, graph_digest)
-            if not graph_id:
-                cursor = conn.execute(
+            conn.execute(
+                """
+                INSERT INTO graphs (digest, name)
+                VALUES (?, ?)
+                ON CONFLICT(digest) DO NOTHING
+                """,
+                (graph_digest, graph.name),
+            )
+
+            for node, node_digest in node_digests.items():
+                conn.execute(
                     """
-                    INSERT INTO graphs (digest, name)
-                    VALUES (?, ?)
+                    INSERT INTO nodes (
+                        digest,
+                        name,
+                        command,
+                        timeout
+                    )
+                    VALUES (?, ?, ?, ?)
                     ON CONFLICT(digest) DO NOTHING
                     """,
-                    (graph_digest, graph.name),
+                    (
+                        node_digest,
+                        node.name,
+                        node.command,
+                        node.timeout,
+                    ),
                 )
-
-                assert cursor.lastrowid
-                graph_id = cursor.lastrowid
-            node_ids: dict[str, int] = {}
-
-            for node in graph.nodes:
-                node_id = _create_node(conn, node)
-                node_ids[_digest(node)] = node_id
 
                 conn.execute(
                     """
                     INSERT INTO graph_nodes (
-                        graph_id,
-                        node_id
+                        graph_digest,
+                        node_digest
                     )
                     VALUES (?, ?)
-                    ON CONFLICT(graph_id, node_id) DO NOTHING
+                    ON CONFLICT(graph_digest, node_digest) DO NOTHING
                     """,
                     (
-                        graph_id,
-                        node_id,
+                        graph_digest,
+                        node_digest,
                     ),
                 )
 
             for from_node, to_node in graph.edges:
-                from_node_id = node_ids[_digest(from_node)]
-                to_node_id = node_ids[_digest(to_node)]
-
                 conn.execute(
                     """
                     INSERT INTO graph_edges (
-                        graph_id,
-                        from_node_id,
-                        to_node_id
+                        graph_digest,
+                        from_node_digest,
+                        to_node_digest
                     )
                     VALUES (?, ?, ?)
                     ON CONFLICT(
-                        graph_id,
-                        from_node_id,
-                        to_node_id
+                        graph_digest,
+                        from_node_digest,
+                        to_node_digest
                     ) DO NOTHING
                     """,
                     (
-                        graph_id,
-                        from_node_id,
-                        to_node_id,
+                        graph_digest,
+                        node_digests[from_node],
+                        node_digests[to_node],
                     ),
                 )
 
+            conn.commit()
+
+    async def start_run(self, run_info: RunInfo) -> None:
+        graph_digest = digest(run_info.graph)
+        system_info = run_info.system_info
+
+        with self._get_connection() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO runs (graph_id, created_at)
-                VALUES (?, ?)
+                INSERT INTO runs (
+                    graph_digest,
+                    created_at,
+                    start_time,
+                    end_time,
+                    hostname,
+                    os_name,
+                    os_release,
+                    os_version,
+                    machine,
+                    cpu_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (graph_id, datetime.now(tz=timezone.utc)),
+                (
+                    graph_digest,
+                    run_info.created_at,
+                    run_info.start_time,
+                    run_info.end_time,
+                    system_info.hostname,
+                    system_info.os_name,
+                    system_info.os_release,
+                    system_info.os_version,
+                    system_info.machine,
+                    system_info.cpu_count,
+                ),
             )
+            conn.commit()
             assert cursor.lastrowid
-            return cursor.lastrowid
+            self._run_ids[run_info.run_id] = cursor.lastrowid
 
-    async def start_run(self, run_id: int) -> None:
+    async def finish_run(self, run_info: RunInfo) -> None:
+        _id = self._run_ids.pop(run_info.run_id)
         with self._get_connection() as conn:
             conn.execute(
                 """
                 UPDATE runs
-                SET start_time = ?
-                WHERE id = ?
-                """,
-                (datetime.now(tz=timezone.utc), run_id),
-            )
-
-    async def finish_run(self, run_id: int) -> None:
-        with self._get_connection() as conn:
-            conn.execute(
-                """
-                UPDATE runs
-                SET end_time = ?
+                SET
+                    start_time = ?,
+                    end_time = ?
                 WHERE id = ?
                 """,
                 (
-                    datetime.now(tz=timezone.utc),
-                    run_id,
+                    run_info.start_time,
+                    run_info.end_time,
+                    _id,
                 ),
             )
 
-    async def start_execution(self, run_id: int, node: Node) -> int:
-        node_digest = _digest(node)
+            conn.commit()
+
+    async def start_execution(self, execution_info: ExecutionInfo) -> None:
+        node_digest = digest(execution_info.node)
+        _run_id = self._run_ids[execution_info.run_info.run_id]
 
         with self._get_connection() as conn:
-            node_id = get_node_by_digest(conn, node_digest)
             curser = conn.execute(
                 """
                 INSERT INTO executions (
                     run_id,
-                    node_id,
-                    start_time
+                    node_digest,
+                    start_time,
+                    end_time
                 )
-                VALUES (?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 """,
                 (
-                    run_id,
-                    node_id,
-                    datetime.now(tz=timezone.utc),
+                    _run_id,
+                    node_digest,
+                    execution_info.start_time,
+                    execution_info.end_time,
                 ),
             )
+            conn.commit()
             assert curser.lastrowid
-            return curser.lastrowid
+            self._execution_ids[execution_info.execution_id] = curser.lastrowid
 
-    async def finish_execution(self, run_id: int, execution_id: int) -> None:
+    async def finish_execution(self, execution_info: ExecutionInfo) -> None:
+        _id = self._execution_ids.pop(execution_info.execution_id)
+        _run_id = self._run_ids[execution_info.run_info.run_id]
+
         with self._get_connection() as conn:
             conn.execute(
                 """
                 UPDATE executions
-                SET end_time = ?
+                SET
+                    start_time = ?,
+                    end_time = ?,
+                    retcode = ?,
+                    result = ?
                 WHERE id = ? AND run_id = ?
                 """,
                 (
-                    datetime.now(tz=timezone.utc),
-                    execution_id,
-                    run_id,
+                    execution_info.start_time,
+                    execution_info.end_time,
+                    execution_info.retcode,
+                    execution_info.result,
+                    _id,
+                    _run_id,
                 ),
             )
+
+            conn.commit()
 
     def _create_tables(self) -> None:
         with self._get_connection() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS nodes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    digest TEXT NOT NULL UNIQUE,
+                    digest TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     command TEXT,
                     timeout REAL
                 );
 
                 CREATE TABLE IF NOT EXISTS graphs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    digest TEXT NOT NULL UNIQUE,
+                    digest TEXT PRIMARY KEY,
                     name TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS graph_nodes (
-                    graph_id INTEGER NOT NULL,
-                    node_id INTEGER NOT NULL,
+                    graph_digest TEXT NOT NULL,
+                    node_digest TEXT NOT NULL,
 
-                    PRIMARY KEY (graph_id, node_id),
+                    PRIMARY KEY (graph_digest, node_digest),
 
-                    FOREIGN KEY (graph_id)
-                        REFERENCES graphs(id)
+                    FOREIGN KEY (graph_digest)
+                        REFERENCES graphs(digest)
                         ON DELETE CASCADE,
 
-                    FOREIGN KEY (node_id)
-                        REFERENCES nodes(id)
+                    FOREIGN KEY (node_digest)
+                        REFERENCES nodes(digest)
                         ON DELETE RESTRICT
                 );
 
                 CREATE TABLE IF NOT EXISTS graph_edges (
-                    graph_id INTEGER NOT NULL,
-                    from_node_id INTEGER NOT NULL,
-                    to_node_id INTEGER NOT NULL,
+                    graph_digest TEXT NOT NULL,
+                    from_node_digest TEXT NOT NULL,
+                    to_node_digest TEXT NOT NULL,
 
                     PRIMARY KEY (
-                        graph_id,
-                        from_node_id,
-                        to_node_id
+                        graph_digest,
+                        from_node_digest,
+                        to_node_digest
                     ),
 
-                    FOREIGN KEY (graph_id)
-                        REFERENCES graphs(id)
+                    FOREIGN KEY (graph_digest)
+                        REFERENCES graphs(digest)
                         ON DELETE CASCADE,
 
-                    FOREIGN KEY (from_node_id)
-                        REFERENCES nodes(id)
+                    FOREIGN KEY (from_node_digest)
+                        REFERENCES nodes(digest)
                         ON DELETE RESTRICT,
 
-                    FOREIGN KEY (to_node_id)
-                        REFERENCES nodes(id)
+                    FOREIGN KEY (to_node_digest)
+                        REFERENCES nodes(digest)
                         ON DELETE RESTRICT
                 );
 
                 CREATE TABLE IF NOT EXISTS runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    graph_id INTEGER NOT NULL,
+                    graph_digest TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     start_time TEXT,
                     end_time TEXT,
 
-                    FOREIGN KEY (graph_id)
-                        REFERENCES graphs(id)
+                    hostname TEXT NOT NULL,
+                    os_name TEXT NOT NULL,
+                    os_release TEXT NOT NULL,
+                    os_version TEXT NOT NULL,
+                    machine TEXT NOT NULL,
+                    cpu_count INTEGER,
+
+                    FOREIGN KEY (graph_digest)
+                        REFERENCES graphs(digest)
                         ON DELETE RESTRICT
                 );
 
                 CREATE TABLE IF NOT EXISTS executions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id INTEGER NOT NULL,
-                    node_id INTEGER NOT NULL,
+                    node_digest TEXT NOT NULL,
+                    retcode INTEGER,
+                    result INTEGER,
                     start_time TEXT,
                     end_time TEXT,
 
@@ -328,28 +322,13 @@ class Sqlite3DBService(DBService):
                         REFERENCES runs(id)
                         ON DELETE CASCADE,
 
-                    FOREIGN KEY (node_id)
-                        REFERENCES nodes(id)
+                    FOREIGN KEY (node_digest)
+                        REFERENCES nodes(digest)
                         ON DELETE RESTRICT
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_graph_nodes_node_id
-                ON graph_nodes(node_id);
-
-                CREATE INDEX IF NOT EXISTS idx_graph_edges_from_node_id
-                ON graph_edges(from_node_id);
-
-                CREATE INDEX IF NOT EXISTS idx_graph_edges_to_node_id
-                ON graph_edges(to_node_id);
-
-                CREATE INDEX IF NOT EXISTS idx_runs_graph_id
-                ON runs(graph_id);
-
-                CREATE INDEX IF NOT EXISTS idx_executions_run_id
-                ON executions(run_id);
-
-                CREATE INDEX IF NOT EXISTS idx_executions_node_id
-                ON executions(node_id);
+                CREATE INDEX IF NOT EXISTS executions_run_id_idx
+                    ON executions(run_id);
                 """
             )
             conn.commit()

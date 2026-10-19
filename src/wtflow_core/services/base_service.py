@@ -4,4 +4,5 @@ from abc import ABC
 
 
 class BaseService(ABC):
-    pass
+    def close(self) -> None:
+        pass
