@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Ido Frenkel", email = "ido123net@gmail.com" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [build-system]
 requires = ["uv_build>=0.11.23,<0.12.0"]
